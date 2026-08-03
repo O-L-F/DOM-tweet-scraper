@@ -1,10 +1,8 @@
 ------------------------------------------------------------------------
 
-editor_options: markdown: wrap: 72 ---
-
 # DOM Tweet Scraper
 
-A free browser userscript that collects tweets from an X (Twitter) profile by reading the page's DOM as you scroll — wtihout an API key or backend server. It runs entirely in your own browser, using your own logged-in session, and saves what it finds to a CSV file on your computer.
+A free browser userscript that collects tweets from an X (Twitter) profile by reading the page's DOM as you scroll — wtihout an API key. It runs entirely in your own browser, using your own logged-in session, and saves what it finds to a CSV file on your computer.
 
 Built with [Tampermonkey](https://www.tampermonkey.net/) in mind, but should work with any userscript manager (Violentmonkey, Greasemonkey, etc.).
 
@@ -15,12 +13,6 @@ Built with [Tampermonkey](https://www.tampermonkey.net/) in mind, but should wor
 - Stores results locally in your browser (`localStorage`) so you can stop and resume without losing progress.
 - Lets you export a single account's tweets, or everything you've collected across accounts, to a `csv` file.
 - Has a small on-page control panel with a live preview of the last few tweets captured, so you can sanity-check it's reading things correctly.
-
-## What it does *not* do
-
-- No API calls — it never touches Twitter's official API.
-- No credentials, tokens, or login handling of its own — it just reads whatever is already rendered on the page while you're browsing normally.
-- No data leaves your machine — everything is local (browser storage + a CSV you download yourself).
 
 ## Installation
 
