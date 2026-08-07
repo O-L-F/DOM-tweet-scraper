@@ -44,19 +44,44 @@ This project is shared for educational and research purposes (e.g. personal arch
 
 *Using a burner account is strongly recommended.*
 
+This tool was designed to look into politicians Tweets, anyone using this tool should refrain from looking at at-risk populations. The advice here is just not to be harmful. 
+
+As an example of _what not to do_ : 
+
+Jaiswal A, Shah A, Harjadi C, Windgassen E, Washington P
+Addendum: Using #ActuallyAutistic on Twitter for Precision Diagnosis of Autism Spectrum Disorder: Machine Learning Study
+JMIR Form Res 2024;8:e59349
+URL: https://formative.jmir.org/2024/1/e59349
+DOI: 10.2196/59349
+
+Feel free to explore this article for more information on scraping :
+
+Brown, M. A., Gruen, A., Maldoff, G., Messing, S., Sanderson, Z., & Zimmer, M. (2025). Web scraping for research: Legal, ethical, institutional, and scientific considerations. Big Data & Society, 12(4), 20539517251381686.
+
 ## Technical specs & Limitations
 
 This is V1 of the project. Updates will be provided sporadically.
 
 - The scraper was built to run on MacOS, using [Brave](https://brave.com/). There is no reason why this should break on other operating systems or browsers, but it has not been tested.
 - There is some stochasticity to the pause and the scroll length function, currently set at 35% -- this seems to help dupe the human verifier.
-- A nice bonus of running it locally is that you get access to Groks translation feature. Some tweets slip through their native language -- especially when you get far down the page.
+- A nice bonus of running it locally is that you get access to Groks translation feature. This feature seems to be exclusive to verified accounts and is time bound (if you go far enough, tweets go back to their native language. 
 - This current model of the build gets timed out after circa 850 tweets collected. The cap on tweets seems to be orthogonal to the pause and scroll length function. Looking a new account seemingly resets the limit to 850 again.
 - Tweets containing Emojis are collected, but the Emojis are not retained. Tweets that are only Emojis are not retained.
 - The `csv` file is coded in UTF-8. Other character encodings have not been tested.
 - The scrapper does not use an OCR, if the post includes a photo, no data about the photo will be collected. A post of only a photo will not be retained.
 - When you run the script, you don't need to stay on the Twitter page, you can browse on other tabs, it will still scrape. There is reason to believe that X tracks mouse movements and clicks. For the longevity of one account, I recommend being on the computer while it scrapes in hopes of further reducing the likelihood of being rate-limited, fingerprinted.
 - If you accidentally click on a post, the scrapper will collect the comments of the tweets and attribute them to the author. This is because the identification process of the tweet relies on the first level of the page which does not change if you are looking at all the posts or a singular post.
+
+
+## Next steps
+
+- As mentioned above, the current script stops you from rolling back further than around 800 tweets.
+    - [Redditors have found this issue](https://www.reddit.com/r/Twitter/comments/1up42q3/does_twitter_limit_how_far_you_can_go_into/)
+    - One savvy user by the name of _cygnusphen_ recommends using the list feature to circumvent this. The next version will hopefully work past the 850 cap.
+- A diagnostics tab is being built. It will be accessible in the Console tab after inspecting the page. 
+- The next iteration will have a toggle for `JSON` formats as `.csv` has some class issues and does not handle different languages quite as well.
+- There will also be a switcher if you want to have different datasets. As a useful organization protocol, have one dataset per list helps to keep everything in order.
+- LocalStorage has a cap of 5MB of data; the new script will migrate to IndexedDB. 
 
 ## License
 
