@@ -11,6 +11,7 @@
 
 (function () {
   "use strict";
+
   function simpleHash(str) {
     let h = 0;
     for (let i = 0; i < str.length; i++) h = (Math.imul(31, h) + str.charCodeAt(i)) | 0;
@@ -71,9 +72,7 @@
 
     let reposterHandle = null;
     if (socialContextEl) {
-      
-      
-      
+
       const ancestorLink = socialContextEl.closest('a[href^="/"]');
       if (ancestorLink) {
         const href = ancestorLink.getAttribute("href") || "";
@@ -520,8 +519,6 @@
     URL.revokeObjectURL(url);
   }
 
-  
-
   let exportDirHandle = null;
 
   async function writeJsonToExportDir(filename, rows) {
@@ -646,7 +643,7 @@
     cooldownMs = 3 * 60 * 1000,
     maxRetries = 2,
     ignoreDuplicateStalls = false,
-    pauseEveryTweets = 0,   
+    pauseEveryTweets = 0,
     pauseMinutes = 5,
     autoExportEnabled = true,
     exportEveryN = 1000
@@ -668,6 +665,7 @@
     let tweetsSinceBreak = 0;
     let nextBreakThreshold = pauseEveryTweets > 0 ? jitterCount(pauseEveryTweets, 0.7) : Infinity;
     let plannedBreaksTaken = 0;
+
     let tweetsSinceExport = 0;
     let exportBatch = [];
     let exportPartNum = 1;
