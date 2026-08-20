@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JSON twitter collector.
 // @namespace    local.tweetcollector
-// @version      1.2
+// @version      1.3
 // @description JSON stuff
 // @match        https://x.com/*
 // @match        https://twitter.com/*
@@ -79,6 +79,7 @@
         const m = href.match(/^\/([A-Za-z0-9_]{1,15})\/?$/);
         if (m) reposterHandle = m[1];
       }
+
       if (!reposterHandle) {
         const profileLinks = socialContextEl.querySelectorAll('a[href^="/"]');
         for (const a of profileLinks) {
@@ -110,6 +111,7 @@
   const LOG_TAG = "[TweetCollector]";
 
   const netLog = { requests: [], patched: false };
+  let verboseNetworkLogging = false;
 
   function looksLikeTimelinePaginationUrl(url) {
     return /\/graphql\/[^/]+\/(UserTweets|UserTweetsAndReplies|UserMedia|UserArticlesTweets|ListLatestTweetsTimeline|ListTimeline)/i.test(url);
@@ -124,14 +126,18 @@
     if (!/\/graphql\//i.test(url)) return;
     const op = extractGraphqlOpName(url) || "(unrecognized graphql path)";
     graphqlOpCounts[op] = (graphqlOpCounts[op] || 0) + 1;
-    console.log(`${LOG_TAG} graphql call: ${op} (seen ${graphqlOpCounts[op]}x this session)`);
+    if (verboseNetworkLogging) {
+      console.log(`${LOG_TAG} graphql call: ${op} (seen ${graphqlOpCounts[op]}x this session)`);
+    }
   }
 
   function recordTimelineRequest(url) {
     const now = Date.now();
     netLog.requests.push(now);
     if (netLog.requests.length > 1000) netLog.requests.shift();
-    console.log(`${LOG_TAG} timeline request #${netLog.requests.length} at ${new Date(now).toISOString()} — ${url}`);
+    if (verboseNetworkLogging) {
+      console.log(`${LOG_TAG} timeline request #${netLog.requests.length} at ${new Date(now).toISOString()} — ${url}`);
+    }
   }
 
   function patchNetworkForDiagnostics() {
@@ -265,7 +271,7 @@
     return results;
   }
 
-  const STORAGE_KEY = "tweetCollector.v1";
+  const STORAGE_KEY = "tweetCollector.v2";
   const IDB_NAME = "tweetCollectorDb";
   const IDB_STORE = "kv";
 
@@ -322,8 +328,6 @@
     });
   }
 
-  
-
   function slugifyDataset(name) {
     const s = (name || "").trim();
     if (!s || s.toLowerCase() === "default") return "default";
@@ -335,13 +339,12 @@
     return slug === "default" ? STORAGE_KEY : `${STORAGE_KEY}::${slug}`;
   }
 
-
-  function accountIndexKey(datasetName) {
-    return storageKeyForDataset(datasetName) + "::accounts";
+  function seenIndexKey(datasetName) {
+    return storageKeyForDataset(datasetName) + "::seenIndex";
   }
 
-  function accountDataKey(datasetName, account) {
-    return storageKeyForDataset(datasetName) + "::acct::" + account;
+  function pendingBatchKey(datasetName) {
+    return storageKeyForDataset(datasetName) + "::pending";
   }
 
   async function listDatasetNames() {
@@ -349,11 +352,10 @@
     const names = new Set();
     const prefix = STORAGE_KEY;
     for (const k of keys) {
-      if (k === prefix) { names.add("default"); continue; } 
       if (!k.startsWith(prefix + "::")) continue;
-      const rest = k.slice(prefix.length + 2);
-      const firstSeg = rest.split("::")[0];
-      if (firstSeg === "accounts" || firstSeg === "acct") {
+      const afterPrefix = k.slice(prefix.length + 2);
+      const firstSeg = afterPrefix.split("::")[0];
+      if (firstSeg === "seenIndex" || firstSeg === "pending") {
         names.add("default");
       } else {
         names.add(firstSeg);
@@ -362,119 +364,100 @@
     return Array.from(names).sort((a, b) => (a === "default" ? -1 : b === "default" ? 1 : a.localeCompare(b)));
   }
 
-  async function loadStore(datasetName) {
-    const idxKey = accountIndexKey(datasetName);
-    let accounts = null;
-    try {
-      accounts = await idbGet(idxKey);
-    } catch (e) {
-      accounts = null;
-    }
+  let currentDataset = "default";
+  let seenIds = {};
+  let pendingBatch = [];
 
-    if (accounts && Array.isArray(accounts)) {
-      const result = {};
-      for (const acct of accounts) {
-        try {
-          const data = await idbGet(accountDataKey(datasetName, acct));
-          if (data) result[acct] = data;
-        } catch (e) {
-          console.error(`${LOG_TAG} failed to load account "${acct}" for dataset "${datasetName}"`, e);
-        }
-      }
-      return result;
-    }
-
-    const legacyKey = storageKeyForDataset(datasetName);
+  async function loadDatasetState(datasetName) {
+    seenIds = {};
+    pendingBatch = [];
     try {
-      const legacyBlob = await idbGet(legacyKey);
-      if (legacyBlob && typeof legacyBlob === "object") {
-        console.log(`${LOG_TAG} migrating legacy single-blob store for dataset "${datasetName}" to per-account records...`);
-        const accts = Object.keys(legacyBlob);
-        for (const acct of accts) {
-          await idbSet(accountDataKey(datasetName, acct), legacyBlob[acct]);
-        }
-        await idbSet(idxKey, accts);
-        await idbDelete(legacyKey);
-        console.log(`${LOG_TAG} migration complete: ${accts.length} account(s) moved to sharded storage.`);
-        return legacyBlob;
+      const raw = await idbGet(seenIndexKey(datasetName));
+      if (raw) {
+        for (const acct of Object.keys(raw)) seenIds[acct] = new Map(raw[acct]);
       }
     } catch (e) {
-      console.error(`${LOG_TAG} legacy load/migration failed for dataset "${datasetName}"`, e);
+      console.error(`${LOG_TAG} failed to load seen-index for dataset "${datasetName}"`, e);
     }
-    return {};
+    try {
+      pendingBatch = (await idbGet(pendingBatchKey(datasetName))) || [];
+    } catch (e) {
+      pendingBatch = [];
+    }
+
+    for (const r of pendingBatch) {
+      if (!seenIds[r.account]) seenIds[r.account] = new Map();
+      const existingLen = seenIds[r.account].get(r.id);
+      if (existingLen === undefined || r.text.length > existingLen) {
+        seenIds[r.account].set(r.id, r.text.length);
+      }
+    }
   }
 
-  async function persistTouchedAccounts(touchedAccounts) {
-    if (!touchedAccounts || touchedAccounts.size === 0) return true;
-    let ok = true;
-    for (const acct of touchedAccounts) {
-      try {
-        await idbSet(accountDataKey(currentDataset, acct), store[acct]);
-      } catch (e) {
-        ok = false;
-        console.error(`${LOG_TAG} failed to save account "${acct}" — this account's new batch stays in memory only, export soon in case the tab closes`, e);
-      }
-    }
+  async function checkpointSeenIndex() {
     try {
-      await idbSet(accountIndexKey(currentDataset), Object.keys(store));
+      const serializable = {};
+      for (const acct of Object.keys(seenIds)) serializable[acct] = Array.from(seenIds[acct].entries());
+      await idbSet(seenIndexKey(currentDataset), serializable);
     } catch (e) {
-      console.error(`${LOG_TAG} failed to update account index for dataset "${currentDataset}"`, e);
+      console.error(`${LOG_TAG} failed to checkpoint dedup index — a future run might re-scrape a few already-exported tweets`, e);
     }
-    return ok;
+  }
+
+  async function checkpointPendingBatch() {
+    try {
+      await idbSet(pendingBatchKey(currentDataset), pendingBatch);
+    } catch (e) {
+      console.error(`${LOG_TAG} failed to checkpoint pending batch — it stays in memory only until the next successful export`, e);
+    }
   }
 
   async function wipeCurrentDataset() {
-    const idxKey = accountIndexKey(currentDataset);
-    let accounts = [];
-    try {
-      accounts = (await idbGet(idxKey)) || [];
-    } catch (e) {}
-    for (const acct of accounts) {
-      try { await idbDelete(accountDataKey(currentDataset, acct)); } catch (e) {}
-    }
-    try { await idbDelete(idxKey); } catch (e) {}
-    try { await idbDelete(storageKeyForDataset(currentDataset)); } catch (e) {} 
+    try { await idbDelete(seenIndexKey(currentDataset)); } catch (e) {}
+    try { await idbDelete(pendingBatchKey(currentDataset)); } catch (e) {}
   }
 
-  let currentDataset = "default";
-  let store = {};
+  function dedupeBatchKeepLongest(batch) {
+    const byId = new Map();
+    for (const r of batch) {
+      const cur = byId.get(r.id);
+      if (!cur || r.text.length > cur.text.length) byId.set(r.id, r);
+    }
+    return Array.from(byId.values());
+  }
 
-  async function addTweetsToStore(tweets) {
+  function addTweetsToStore(tweets) {
     const addedItems = [];
     const updatedItems = [];
-    const touchedAccounts = new Set();
     let skipped = 0;
     for (const t of tweets) {
       const acct = t.account || "unknown";
-      if (!store[acct]) store[acct] = {};
-      const existing = store[acct][t.id];
-      const record = { day: t.day, account: acct, type: t.type, text: t.text };
-      if (!existing) {
-        store[acct][t.id] = record;
+      if (!seenIds[acct]) seenIds[acct] = new Map();
+      const priorLen = seenIds[acct].get(t.id);
+      const record = { id: t.id, day: t.day, account: acct, type: t.type, text: t.text };
+      if (priorLen === undefined) {
+        seenIds[acct].set(t.id, t.text.length);
+        pendingBatch.push(record);
         addedItems.push(record);
-        touchedAccounts.add(acct);
-      } else if (t.text.length > existing.text.length) {
-        console.log(`${LOG_TAG} correcting stored text for ${t.id}: ${existing.text.length} -> ${t.text.length} chars`);
-        store[acct][t.id] = record;
+      } else if (t.text.length > priorLen) {
+        seenIds[acct].set(t.id, t.text.length);
+        pendingBatch.push(record);
         updatedItems.push(record);
-        touchedAccounts.add(acct);
       } else {
         skipped++;
       }
     }
-    if (touchedAccounts.size) await persistTouchedAccounts(touchedAccounts);
     return { added: addedItems.length, updated: updatedItems.length, skipped, addedItems, updatedItems };
   }
 
-  function accountRows(handle) {
-    const bucket = store[handle] || {};
-    return Object.values(bucket).sort((a, b) => (a.day || "").localeCompare(b.day || ""));
+  function pendingRowsForAccount(handle) {
+    return dedupeBatchKeepLongest(pendingBatch.filter(r => r.account === handle))
+      .sort((a, b) => (a.day || "").localeCompare(b.day || ""));
   }
 
-  function allRows() {
-    let out = [];
-    for (const handle of Object.keys(store)) out = out.concat(accountRows(handle));
-    return out;
+  function pendingRowsAll() {
+    return dedupeBatchKeepLongest(pendingBatch)
+      .sort((a, b) => (a.day || "").localeCompare(b.day || ""));
   }
 
 
@@ -518,7 +501,6 @@
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
   }
-
   let exportDirHandle = null;
 
   async function writeJsonToExportDir(filename, rows) {
@@ -550,6 +532,32 @@
     if (!link) return null;
     const m = (link.getAttribute("href") || "").match(/^\/([A-Za-z0-9_]{1,15})\/status\//);
     return m ? m[1] : null;
+  }
+
+  let aggressiveMediaUnload = false;
+
+  function unloadOffscreenMedia() {
+    if (!aggressiveMediaUnload) return 0;
+    const threshold = window.innerHeight * 4;
+    const articles = document.querySelectorAll('article[data-testid="tweet"]');
+    let unloaded = 0;
+    for (const article of articles) {
+      let rect;
+      try { rect = article.getBoundingClientRect(); } catch (e) { continue; }
+      if (rect.bottom < -threshold) {
+        const imgs = article.querySelectorAll('img[src^="https://pbs.twimg.com"]');
+        for (const img of imgs) {
+          if (img.dataset.tcUnloaded) continue;
+          try {
+            img.dataset.tcUnloaded = "1";
+            img.removeAttribute("srcset");
+            img.src = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBTAA7";
+            unloaded++;
+          } catch (e) {}
+        }
+      }
+    }
+    return unloaded;
   }
 
 
@@ -666,8 +674,6 @@
     let nextBreakThreshold = pauseEveryTweets > 0 ? jitterCount(pauseEveryTweets, 0.7) : Infinity;
     let plannedBreaksTaken = 0;
 
-    let tweetsSinceExport = 0;
-    let exportBatch = [];
     let exportPartNum = 1;
     let exportsWritten = 0;
     const exportActive = autoExportEnabled && !!exportDirHandle;
@@ -678,27 +684,36 @@
 
     function totalStoredForSessionAccounts() {
       let total = 0;
-      for (const a of sessionAccounts) total += Object.keys(store[a] || {}).length;
+      for (const a of sessionAccounts) total += seenIds[a] ? seenIds[a].size : 0;
       return total;
     }
 
     async function flushExportBatch(reason) {
-      if (!exportActive || exportBatch.length === 0) return;
+      if (!exportActive || pendingBatch.length === 0) return;
+      const toWrite = dedupeBatchKeepLongest(pendingBatch);
       const filename = `tweets_${slugifyDataset(currentDataset)}_part${String(exportPartNum).padStart(4, "0")}_${Date.now()}.json`;
-      const batchToWrite = exportBatch;
-      exportBatch = [];
-      tweetsSinceExport = 0;
-      exportPartNum++;
-      const wrote = await writeJsonToExportDir(filename, batchToWrite);
-      if (wrote) exportsWritten++;
-      onProgress({
-        scrollCount, maxScrolls, sessionAdded, sessionUpdated,
-        totalForAccount: totalStoredForSessionAccounts(), accountsThisSession: sessionAccounts.size,
-        recentTweets, netStats: timelineRequestStats(), retriesUsed,
-        cooldownMessage: wrote
-          ? `Auto-exported ${batchToWrite.length} tweets to ${filename} (${reason}).`
-          : `Auto-export failed for ${filename} — check console. Data is still safe in IndexedDB either way.`
-      });
+      const wrote = await writeJsonToExportDir(filename, toWrite);
+      if (wrote) {
+        exportsWritten++;
+        exportPartNum++;
+        const writtenCount = pendingBatch.length;
+        pendingBatch = [];
+        await checkpointPendingBatch();
+        await checkpointSeenIndex();
+        onProgress({
+          scrollCount, maxScrolls, sessionAdded, sessionUpdated,
+          totalForAccount: totalStoredForSessionAccounts(), accountsThisSession: sessionAccounts.size,
+          recentTweets, netStats: timelineRequestStats(), retriesUsed,
+          cooldownMessage: `Auto-exported ${writtenCount} tweets to ${filename} (${reason}); wiped from browser storage.`
+        });
+      } else {
+        onProgress({
+          scrollCount, maxScrolls, sessionAdded, sessionUpdated,
+          totalForAccount: totalStoredForSessionAccounts(), accountsThisSession: sessionAccounts.size,
+          recentTweets, netStats: timelineRequestStats(), retriesUsed,
+          cooldownMessage: `Auto-export failed for ${filename} — check console. Nothing wiped; ${pendingBatch.length} tweets still buffered, will retry at next threshold or run end.`
+        });
+      }
     }
 
     while (scrollCount < maxScrolls && !stopRequested) {
@@ -712,6 +727,7 @@
 
       const articles = Array.from(document.querySelectorAll('article[data-testid="tweet"]'));
       await expandShowMoreButtons(articles);
+      unloadOffscreenMedia();
 
       const found = extractVisibleTweets(account);
       const hitCutoff = stopIfBeforeDate(found, stopBeforeDate);
@@ -719,7 +735,7 @@
         ? found.filter(t => t.type.startsWith("repost:") || !t.day || t.day >= stopBeforeDate)
         : found;
 
-      const { added, updated, addedItems, updatedItems } = await addTweetsToStore(inRange);
+      const { added, updated, addedItems, updatedItems } = addTweetsToStore(inRange);
       sessionAdded += added;
       sessionUpdated += updated;
       tweetsSinceBreak += added;
@@ -728,9 +744,8 @@
       for (const item of updatedItems) sessionAccounts.add(item.account);
       for (const t of inRange) sessionAccounts.add(t.account);
 
-      if (exportActive) {
-        if (addedItems.length || updatedItems.length) exportBatch.push(...addedItems, ...updatedItems);
-        tweetsSinceExport += added;
+      if (exportActive && (addedItems.length || updatedItems.length)) {
+        await checkpointPendingBatch();
       }
 
       if (added === 0 && updated === 0) {
@@ -768,7 +783,7 @@
         break;
       }
 
-      if (exportActive && tweetsSinceExport >= exportEveryN) {
+      if (exportActive && pendingBatch.length >= exportEveryN) {
         await flushExportBatch("threshold reached");
       }
 
@@ -959,7 +974,7 @@
         <label><input type="checkbox" id="tc-autoretry" style="width:auto;"> Auto cooldown + retry on stall</label>
         <label>Cooldown (min) <input type="number" id="tc-cooldown" value="3" min="1" max="30"></label>
       </div>
-      <h4>Auto-export to disk</h4>
+      <h4>Auto-export to disk (also frees browser memory)</h4>
       <div class="tc-row">
         <button id="tc-choose-export-dir" class="secondary">Choose export folder</button>
         <span id="tc-export-dir-label">No folder chosen (auto-export off until you pick one)</span>
@@ -967,8 +982,15 @@
       <div class="tc-row">
         <label><input type="checkbox" id="tc-autoexport-enabled" checked style="width:auto;"> Auto-export every
           <input type="number" id="tc-autoexport-every" value="1000" min="10" max="50000" style="width:70px;">
-          tweets
+          tweets, then wipe from browser storage
         </label>
+      </div>
+      <h4>Performance (experimental)</h4>
+      <div class="tc-row">
+        <label><input type="checkbox" id="tc-verbose-logging" style="width:auto;"> Verbose console logging</label>
+      </div>
+      <div class="tc-row">
+        <label><input type="checkbox" id="tc-media-unload" style="width:auto;"> Aggressively unload offscreen images</label>
       </div>
       <div class="tc-row">
         <button id="tc-start">Start collecting</button>
@@ -979,15 +1001,15 @@
       <h4>Sanity check — last 5 scraped</h4>
       <div id="tc-preview"><div class="tc-empty">Nothing scraped yet.</div></div>
       <div class="tc-row">
-        <button id="tc-export-account" class="secondary">Export this account CSV</button>
+        <button id="tc-export-account" class="secondary">Export pending (this account) CSV</button>
         <button id="tc-export-account-json" class="secondary">JSON</button>
       </div>
       <div class="tc-row">
-        <button id="tc-export-all" class="secondary">Export ALL accounts CSV</button>
+        <button id="tc-export-all" class="secondary">Export pending (all accounts) CSV</button>
         <button id="tc-export-all-json" class="secondary">JSON</button>
       </div>
       <div class="tc-row">
-        <button id="tc-wipe" class="danger">Wipe all data</button>
+        <button id="tc-wipe" class="danger">Wipe dataset (browser only)</button>
       </div>
       <div class="tc-status" id="tc-storesummary"></div>
     `;
@@ -1006,12 +1028,14 @@
 
   function refreshStoreSummary() {
     const el = document.getElementById("tc-storesummary");
-    const handles = Object.keys(store);
+    const handles = Object.keys(seenIds);
     if (handles.length === 0) {
-      el.textContent = "No accounts stored yet.";
+      el.textContent = "No accounts tracked yet.";
       return;
     }
-    el.textContent = handles.map(h => `@${h}: ${Object.keys(store[h]).length}`).join("  ·  ");
+    const pendingCounts = {};
+    for (const r of pendingBatch) pendingCounts[r.account] = (pendingCounts[r.account] || 0) + 1;
+    el.textContent = handles.map(h => `@${h}: ${seenIds[h].size} seen (${pendingCounts[h] || 0} pending export)`).join("  ·  ");
   }
 
   async function refreshDatasetList() {
@@ -1080,6 +1104,14 @@
       }
     });
 
+    document.getElementById("tc-verbose-logging").addEventListener("change", (e) => {
+      verboseNetworkLogging = e.target.checked;
+    });
+
+    document.getElementById("tc-media-unload").addEventListener("change", (e) => {
+      aggressiveMediaUnload = e.target.checked;
+    });
+
     startBtn.addEventListener("click", async () => {
       const handle = refreshHandleDisplay();
       if (!handle) {
@@ -1101,8 +1133,11 @@
       const exportEveryN = parseInt(document.getElementById("tc-autoexport-every").value, 10) || 1000;
 
       if (autoExportEnabled && !exportDirHandle) {
-        statusEl.textContent = "Auto-export is checked but no folder is chosen yet — click \"Choose export folder\" first, or uncheck auto-export. (Data still saves to IndexedDB either way.)";
+        statusEl.textContent = "Auto-export is checked but no folder is chosen yet — click \"Choose export folder\" first, or uncheck auto-export.";
         return;
+      }
+      if (!autoExportEnabled) {
+        statusEl.textContent = "Heads up: auto-export is off, so nothing is saved durably during this run — only in memory until you stop and manually export. Recommended for short test runs only.";
       }
 
       startBtn.disabled = true;
@@ -1128,9 +1163,10 @@
           const acctNote = p.accountsThisSession > 1 ? ` across ${p.accountsThisSession} accounts` : "";
           statusEl.textContent = p.cooldownMessage ||
             (`scroll ${p.scrollCount}/${p.maxScrolls} — ` +
-            `+${p.sessionAdded} new, ${p.sessionUpdated} corrected, ${p.totalForAccount} total stored${acctNote}.` +
+            `+${p.sessionAdded} new, ${p.sessionUpdated} corrected, ${p.totalForAccount} total seen this session${acctNote}, ${pendingBatch.length} pending export.` +
             (p.retriesUsed ? ` (retry ${p.retriesUsed}/2 used)` : ""));
           renderPreview(p.recentTweets);
+          refreshStoreSummary();
           if (p.netStats) {
             const el = document.getElementById("tc-netstats");
             el.textContent = `Timeline requests seen this session: ${p.netStats.total}` +
@@ -1150,7 +1186,7 @@
       }[result.stopReason] || result.stopReason;
       const retryNote = result.retriesUsed ? ` Used ${result.retriesUsed} auto-retry cooldown(s) along the way.` : "";
       const breakNote = result.plannedBreaksTaken ? ` Took ${result.plannedBreaksTaken} scheduled break(s).` : "";
-      const exportNote = result.exportActive ? ` Wrote ${result.exportsWritten} export file(s) to disk.` : "";
+      const exportNote = result.exportActive ? ` Wrote ${result.exportsWritten} export file(s) to disk and wiped them from browser storage.` : " Auto-export was off — remember to export manually before closing the tab.";
       const suspendNote = result.suspectedSuspendEvents
         ? ` Saw ${result.suspectedSuspendEvents} large wall-clock gap(s) that look like system/tab sleep, not a real stall — check console.`
         : "";
@@ -1171,48 +1207,51 @@
 
     document.getElementById("tc-export-account").addEventListener("click", () => {
       const handle = refreshHandleDisplay();
-      if (!handle || !store[handle]) {
-        statusEl.textContent = "No stored data for the current profile yet.";
+      const rows = handle ? pendingRowsForAccount(handle) : [];
+      if (rows.length === 0) {
+        statusEl.textContent = "No pending (not-yet-auto-exported) data for the current profile.";
         return;
       }
-      downloadCsv(`tweets_${handle}.csv`, toCsv(accountRows(handle)));
+      downloadCsv(`tweets_${handle}_pending.csv`, toCsv(rows));
     });
 
     document.getElementById("tc-export-account-json").addEventListener("click", () => {
       const handle = refreshHandleDisplay();
-      if (!handle || !store[handle]) {
-        statusEl.textContent = "No stored data for the current profile yet.";
+      const rows = handle ? pendingRowsForAccount(handle) : [];
+      if (rows.length === 0) {
+        statusEl.textContent = "No pending (not-yet-auto-exported) data for the current profile.";
         return;
       }
-      downloadJson(`tweets_${handle}.json`, toJson(accountRows(handle)));
+      downloadJson(`tweets_${handle}_pending.json`, toJson(rows));
     });
 
     document.getElementById("tc-export-all").addEventListener("click", () => {
-      const rows = allRows();
+      const rows = pendingRowsAll();
       if (rows.length === 0) {
-        statusEl.textContent = "Nothing stored yet.";
+        statusEl.textContent = "Nothing pending right now.";
         return;
       }
-      downloadCsv("tweets_all_accounts.csv", toCsv(rows));
+      downloadCsv("tweets_pending_all_accounts.csv", toCsv(rows));
     });
 
     document.getElementById("tc-export-all-json").addEventListener("click", () => {
-      const rows = allRows();
+      const rows = pendingRowsAll();
       if (rows.length === 0) {
-        statusEl.textContent = "Nothing stored yet.";
+        statusEl.textContent = "Nothing pending right now.";
         return;
       }
-      downloadJson("tweets_all_accounts.json", toJson(rows));
+      downloadJson("tweets_pending_all_accounts.json", toJson(rows));
     });
 
     document.getElementById("tc-wipe").addEventListener("click", async () => {
-      if (confirm("Delete ALL stored tweets for ALL accounts in this dataset? This cannot be undone.")) {
+      if (confirm("Clear this dataset's dedup index and pending (not-yet-exported) batch from the browser? Files already written to your export folder are not affected. This cannot be undone.")) {
         await wipeCurrentDataset();
-        store = {};
+        seenIds = {};
+        pendingBatch = [];
         recentTweets = [];
         refreshStoreSummary();
         renderPreview(recentTweets);
-        statusEl.textContent = "All data wiped for this dataset.";
+        statusEl.textContent = "Dataset wiped from browser storage.";
       }
     });
 
@@ -1225,13 +1264,13 @@
       const requested = datasetInput.value.trim() || "default";
       statusEl.textContent = `Switching to dataset "${requested}"...`;
       currentDataset = requested;
-      store = await loadStore(currentDataset);
+      await loadDatasetState(currentDataset);
       datasetInput.value = slugifyDataset(requested);
       recentTweets = [];
       renderPreview(recentTweets);
       refreshStoreSummary();
       await refreshDatasetList();
-      statusEl.textContent = `Now using dataset "${currentDataset}" (${Object.keys(store).length} account(s) stored here).`;
+      statusEl.textContent = `Now using dataset "${currentDataset}" (${Object.keys(seenIds).length} account(s) tracked, ${pendingBatch.length} pending export).`;
     });
 
     document.getElementById("tc-dataset-list").addEventListener("change", (e) => {
@@ -1252,7 +1291,7 @@
   (async () => {
     if (document.getElementById("tc-panel")) return;
     patchNetworkForDiagnostics();
-    store = await loadStore(currentDataset);
+    await loadDatasetState(currentDataset);
     initUI();
     refreshDatasetList();
   })();
