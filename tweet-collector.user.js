@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JSON X-list collector
 // @namespace    local.tweetcollector
-// @version      2.1
+// @version      2.2
 // @description  Scrapes tweets from an X/Twitter LIST timeline into JSON.
 // @match        https://x.com/i/lists/*
 // @match        https://twitter.com/i/lists/*
@@ -264,6 +264,25 @@
         }
     }
 
+    const httpErrorLog = [];
+
+    function recordHttpErrorStatus(status, url) {
+        httpErrorLog.push({ t: Date.now(), status, url: String(url || "") });
+
+        if (httpErrorLog.length > 200) {
+            httpErrorLog.shift();
+        }
+
+        if (verboseNetworkLogging) {
+            console.warn(`${LOG_TAG} http error status ${status} on ${url}`);
+        }
+    }
+
+    function recentHttpErrorCount(windowMs = 60000) {
+        const now = Date.now();
+        return httpErrorLog.filter(e => now - e.t <= windowMs).length;
+    }
+
     function patchNetworkForDiagnostics() {
         if (netLog.patched) return;
 
@@ -273,8 +292,10 @@
 
         if (origFetch) {
             window.fetch = function (...args) {
+                let url = "";
+
                 try {
-                    const url =
+                    url =
                         typeof args[0] === "string"
                             ? args[0]
                             : (args[0] && args[0].url) || "";
@@ -286,7 +307,27 @@
                     }
                 } catch (e) {}
 
-                return origFetch.apply(this, args);
+                const result = origFetch.apply(this, args);
+
+                if (result && typeof result.then === "function") {
+                    result.then(
+                        res => {
+                            try {
+                                if (
+                                    res &&
+                                    (res.status === 429 ||
+                                        res.status === 403 ||
+                                        res.status >= 500)
+                                ) {
+                                    recordHttpErrorStatus(res.status, url);
+                                }
+                            } catch (e) {}
+                        },
+                        () => {}
+                    );
+                }
+
+                return result;
             };
         }
 
@@ -299,6 +340,18 @@
                 if (looksLikeTimelinePaginationUrl(url)) {
                     recordTimelineRequest(url);
                 }
+
+                this.addEventListener("loadend", () => {
+                    try {
+                        if (
+                            this.status === 429 ||
+                            this.status === 403 ||
+                            this.status >= 500
+                        ) {
+                            recordHttpErrorStatus(this.status, url);
+                        }
+                    } catch (e) {}
+                });
             } catch (e) {}
 
             return origOpen.call(this, method, url, ...rest);
@@ -328,6 +381,10 @@
     }
 
     function looksRateLimited() {
+        if (recentHttpErrorCount(60000) > 0) {
+            return true;
+        }
+
         const container =
             document.querySelector('div[data-testid="primaryColumn"]') ||
             document.body;
@@ -423,9 +480,28 @@
     const STORAGE_KEY = "tweetCollector.v2";
     const IDB_NAME = "tweetCollectorDb";
     const IDB_STORE = "kv";
+    const LAST_DATASET_KEY = "tweetCollector.lastDataset";
+
+    function loadLastDatasetName() {
+        try {
+            return localStorage.getItem(LAST_DATASET_KEY) || "default";
+        } catch (e) {
+            return "default";
+        }
+    }
+
+    function saveLastDatasetName(name) {
+        try {
+            localStorage.setItem(LAST_DATASET_KEY, name);
+        } catch (e) {}
+    }
+
+    let dbPromise = null;
 
     function openDb() {
-        return new Promise((resolve, reject) => {
+        if (dbPromise) return dbPromise;
+
+        dbPromise = new Promise((resolve, reject) => {
             const req = indexedDB.open(IDB_NAME, 1);
 
             req.onupgradeneeded = () => {
@@ -435,8 +511,13 @@
             };
 
             req.onsuccess = () => resolve(req.result);
-            req.onerror = () => reject(req.error);
+            req.onerror = () => {
+                dbPromise = null;
+                reject(req.error);
+            };
         });
+
+        return dbPromise;
     }
 
     async function idbGet(key) {
@@ -555,7 +636,7 @@
         );
     }
 
-    let currentDataset = "default";
+    let currentDataset = loadLastDatasetName();
     let seenIds = {};
     let pendingBatch = [];
 
@@ -775,51 +856,119 @@
         }
     }
 
-    async function logHeapSnapshot(settings) {
-        try {
-            const entry = {
-                t: Date.now(),
-                pendingLen: pendingBatch.length,
-                articleCount:
-                    document.querySelectorAll(
-                        'article[data-testid="tweet"]'
-                    ).length,
-                domNodeCount:
-                    document.getElementsByTagName("*").length,
-                heapMB: performance.memory
-                    ? Math.round(
-                        performance.memory.usedJSHeapSize /
-                        1048576
-                    )
-                    : null,
-                settings: {
-                    maxScrolls: settings.maxScrolls,
-                    pauseMs: settings.pauseMs,
-                    scrollStrategy: settings.scrollStrategy,
-                    longBreakEnabled: settings.longBreakEnabled,
-                    pauseEveryTweets: settings.pauseEveryTweets,
-                    pauseMinutes: settings.pauseMinutes,
-                    autoRetryEnabled: settings.autoRetryEnabled,
-                    cooldownMinutes: settings.cooldownMinutes,
-                    maxRetries: settings.maxRetries,
-                    autoExportEnabled: settings.autoExportEnabled,
-                    exportEveryN: settings.exportEveryN,
-                    verboseConsoleLogging:
-                        settings.verboseConsoleLogging
-                }
-            };
+    let diagRingBuffer = [];
+    let lastDiagWriteAt = null;
+    let lastDiagWriteError = null;
+    let diagIntervalHandle = null;
+    let diagEventsWired = false;
 
+    function pushDiagRing(entry) {
+        diagRingBuffer.push(entry);
+
+        if (diagRingBuffer.length > 150) {
+            diagRingBuffer.shift();
+        }
+    }
+
+    async function logHeapSnapshot(settings, extra) {
+        const s = settings || {};
+
+        const entry = {
+            t: Date.now(),
+            pendingLen: pendingBatch.length,
+            articleCount:
+                document.querySelectorAll(
+                    'article[data-testid="tweet"]'
+                ).length,
+            domNodeCount:
+                document.getElementsByTagName("*").length,
+            heapMB: performance.memory
+                ? Math.round(
+                    performance.memory.usedJSHeapSize /
+                    1048576
+                )
+                : null,
+            visibility: document.visibilityState,
+            recentHttpErrors: recentHttpErrorCount(300000),
+            note: (extra && extra.note) || null,
+            settings: {
+                maxScrolls: s.maxScrolls,
+                pauseMs: s.pauseMs,
+                scrollStrategy: s.scrollStrategy,
+                longBreakEnabled: s.longBreakEnabled,
+                pauseEveryTweets: s.pauseEveryTweets,
+                pauseMinutes: s.pauseMinutes,
+                autoRetryEnabled: s.autoRetryEnabled,
+                cooldownMinutes: s.cooldownMinutes,
+                maxRetries: s.maxRetries,
+                autoExportEnabled: s.autoExportEnabled,
+                exportEveryN: s.exportEveryN,
+                verboseConsoleLogging: s.verboseConsoleLogging
+            }
+        };
+
+        pushDiagRing(entry);
+
+        try {
             const key = heapLogKey(currentDataset);
             const log = (await idbGet(key)) || [];
 
             log.push(entry);
 
-            if (log.length > 2000) {
+            if (log.length > 3000) {
                 log.shift();
             }
 
             await idbSet(key, log);
-        } catch (e) {}
+
+            lastDiagWriteAt = Date.now();
+            lastDiagWriteError = null;
+        } catch (e) {
+            lastDiagWriteError = (e && e.message) || String(e);
+
+            console.error(
+                `${LOG_TAG} diagnostic write failed`,
+                e
+            );
+        }
+    }
+
+    function startDiagInterval(settings) {
+        stopDiagInterval();
+
+        diagIntervalHandle = setInterval(() => {
+            logHeapSnapshot(settings);
+        }, 20000);
+    }
+
+    function stopDiagInterval() {
+        if (diagIntervalHandle) {
+            clearInterval(diagIntervalHandle);
+            diagIntervalHandle = null;
+        }
+    }
+
+    function setupDiagnosticEventLogging(getSettings) {
+        if (diagEventsWired) return;
+        diagEventsWired = true;
+
+        document.addEventListener("visibilitychange", () => {
+            logHeapSnapshot(getSettings(), {
+                note: `visibility -> ${document.visibilityState}`
+            });
+        });
+
+        window.addEventListener("pagehide", () => {
+            logHeapSnapshot(getSettings(), { note: "pagehide" });
+        });
+
+        window.addEventListener("freeze", () => {
+            logHeapSnapshot(getSettings(), { note: "freeze" });
+        });
+
+        window.addEventListener("resume", () => {
+            logHeapSnapshot(getSettings(), { note: "resume" });
+        });
     }
 
     async function dumpDiagnosticsLog() {
@@ -835,7 +984,17 @@
 
         downloadJson(
             `tweets_${slugifyDataset(currentDataset)}_diagnostics.json`,
-            JSON.stringify(log, null, 2)
+            JSON.stringify(
+                {
+                    persisted: log,
+                    recentRingBuffer: diagRingBuffer,
+                    lastDiagWriteAt,
+                    lastDiagWriteError,
+                    recentHttpErrorLog: httpErrorLog
+                },
+                null,
+                2
+            )
         );
     }
 
@@ -991,6 +1150,8 @@
         );
     }
 
+    const SOFT_RATE_CAP_PER_MIN = 30;
+
     async function runCollectionLoop({
         account,
         maxScrolls,
@@ -1036,14 +1197,13 @@
         let exportActive =
             autoExportEnabled && !!exportDirHandle;
 
-        let diagCounter = 0;
-
         const wakeLogFn = msg =>
             console.log(`${LOG_TAG} ${msg}`);
 
         await requestWakeLock(wakeLogFn);
         setupWakeLockReacquire(wakeLogFn);
         patchNetworkForDiagnostics();
+        startDiagInterval(diagnosticSettings);
 
         function totalStoredForSessionAccounts() {
             let total = 0;
@@ -1099,6 +1259,10 @@
                         retriesUsed,
                         netStats:
                             timelineRequestStats(),
+                        diagStatus: {
+                            lastDiagWriteAt,
+                            lastDiagWriteError
+                        },
                         cooldownMessage:
                             `Auto-exported ${writtenCount} tweets to ${filename} (${reason}); wiped from browser storage.`
                     });
@@ -1142,6 +1306,10 @@
                 retriesUsed,
                 netStats:
                     timelineRequestStats(),
+                diagStatus: {
+                    lastDiagWriteAt,
+                    lastDiagWriteError
+                },
                 cooldownMessage:
                     `No export folder available — downloaded ${writtenCount} tweets as ${filename} instead (${reason}).`
             });
@@ -1151,6 +1319,16 @@
             scrollCount < maxScrolls &&
             !stopRequested
         ) {
+            if (!isOnListTimeline()) {
+                stopReason = "navigated_away";
+
+                await logHeapSnapshot(diagnosticSettings, {
+                    note: "navigated away from list mid-run"
+                });
+
+                break;
+            }
+
             const articles = Array.from(
                 document.querySelectorAll(
                     'article[data-testid="tweet"]'
@@ -1217,13 +1395,6 @@
                 consecutiveNoNewTweets = 0;
             }
 
-            diagCounter++;
-
-            if (diagCounter >= 20) {
-                diagCounter = 0;
-                logHeapSnapshot(diagnosticSettings);
-            }
-
             const suspectRateLimitNow =
                 looksRateLimited();
 
@@ -1244,7 +1415,11 @@
                 recentTweets,
                 hitCutoff,
                 retriesUsed,
-                netStats
+                netStats,
+                diagStatus: {
+                    lastDiagWriteAt,
+                    lastDiagWriteError
+                }
             });
 
             if (hitCutoff) {
@@ -1288,6 +1463,10 @@
                     recentTweets,
                     retriesUsed,
                     netStats,
+                    diagStatus: {
+                        lastDiagWriteAt,
+                        lastDiagWriteError
+                    },
                     cooldownMessage:
                         `Scheduled break #${plannedBreaksTaken}: pausing ${pauseMinutes} min after ~${thisBreakThreshold} tweets.`
                 });
@@ -1310,8 +1489,14 @@
                 ) {
                     retriesUsed++;
 
+                    const backoffMultiplier =
+                        Math.pow(1.7, retriesUsed - 1);
+
                     const thisCooldown =
-                        jitter(cooldownMs, 0.25);
+                        jitter(
+                            cooldownMs * backoffMultiplier,
+                            0.25
+                        );
 
                     onProgress({
                         scrollCount,
@@ -1324,8 +1509,16 @@
                         recentTweets,
                         retriesUsed,
                         netStats,
+                        diagStatus: {
+                            lastDiagWriteAt,
+                            lastDiagWriteError
+                        },
                         cooldownMessage:
-                            `Page shows a rate-limit/error message. Cooling down ~${Math.round(thisCooldown / 60000)} min before retry ${retriesUsed}/${maxRetries}...`
+                            `Page (or the network layer) shows a rate-limit/error signal. Cooling down ~${Math.round(thisCooldown / 60000)} min before retry ${retriesUsed}/${maxRetries}...`
+                    });
+
+                    await logHeapSnapshot(diagnosticSettings, {
+                        note: `rate-limit signal, retry ${retriesUsed}/${maxRetries}`
                     });
 
                     await sleep(thisCooldown);
@@ -1358,8 +1551,14 @@
                 ) {
                     retriesUsed++;
 
+                    const backoffMultiplier =
+                        Math.pow(1.7, retriesUsed - 1);
+
                     const thisCooldown =
-                        jitter(cooldownMs, 0.25);
+                        jitter(
+                            cooldownMs * backoffMultiplier,
+                            0.25
+                        );
 
                     onProgress({
                         scrollCount,
@@ -1372,6 +1571,10 @@
                         recentTweets,
                         retriesUsed,
                         netStats,
+                        diagStatus: {
+                            lastDiagWriteAt,
+                            lastDiagWriteError
+                        },
                         cooldownMessage:
                             `No new tweets loading. Cooling down ~${Math.round(thisCooldown / 60000)} min before retry ${retriesUsed}/${maxRetries}...`
                     });
@@ -1391,6 +1594,10 @@
 
                 stopReason = "no_new_tweets";
                 break;
+            }
+
+            if (netStats.ratePerMin > SOFT_RATE_CAP_PER_MIN) {
+                await sleep(jitter(4000, 0.4));
             }
 
             const step =
@@ -1421,6 +1628,8 @@
         }
 
         await flushExportBatch("end of run");
+
+        stopDiagInterval();
 
         collecting = false;
         releaseWakeLock();
@@ -1496,7 +1705,7 @@
         panel.innerHTML = `
       <h3>Tweet Collector (Lists only)</h3>
       <div class="tc-row">
-        <label>Saved list name <input type="text" id="tc-dataset" value="default" placeholder="e.g. politicians-list"></label>
+        <label>Saved list name <input type="text" id="tc-dataset" value="${escapeHtml(currentDataset)}" placeholder="e.g. politicians-list"></label>
         <button id="tc-dataset-switch" class="secondary">Switch</button>
       </div>
       <div class="tc-row">
@@ -1561,6 +1770,7 @@
       </div>
       <div class="tc-status" id="tc-status">Idle. Navigate to a List's Tweets tab, then press Start.</div>
       <div class="tc-status" id="tc-netstats"></div>
+      <div class="tc-status" id="tc-diagstatus"></div>
       <h4>Sanity check — last 5 scraped</h4>
       <div id="tc-preview"><div class="tc-empty">Nothing scraped yet.</div></div>
       <div class="tc-row">
@@ -1604,6 +1814,24 @@
                     `@${h}: ${seenIds[h].size} seen (${pendingCounts[h] || 0} pending export)`
             )
             .join("  ·  ");
+    }
+
+    function updateDiagStatusUI() {
+        const el =
+            document.getElementById("tc-diagstatus");
+
+        if (!el) return;
+
+        if (lastDiagWriteError) {
+            el.textContent =
+                `Diagnostics: last write FAILED (${lastDiagWriteError}).`;
+        } else if (lastDiagWriteAt) {
+            el.textContent =
+                `Diagnostics: last saved ${Math.round((Date.now() - lastDiagWriteAt) / 1000)}s ago.`;
+        } else {
+            el.textContent =
+                "Diagnostics: no snapshot saved yet.";
+        }
     }
 
     async function refreshDatasetList() {
@@ -1850,6 +2078,11 @@
         buildPanel();
         refreshStoreSummary();
         renderPreview(recentTweets);
+        updateDiagStatusUI();
+
+        setInterval(updateDiagStatusUI, 5000);
+
+        setupDiagnosticEventLogging(readSettingsFromUI);
 
         const startBtn =
             document.getElementById(
@@ -1914,7 +2147,7 @@
                     await dumpDiagnosticsLog();
 
                     statusEl.textContent =
-                        "Diagnostics log downloaded (heap size, DOM node count, article count, pending-batch size sampled every ~20 scrolls).";
+                        "Diagnostics log downloaded (heap size, DOM node count, article count, pending-batch size, visibility/backgrounding events, and recent HTTP error statuses).";
                 }
             );
 
@@ -2023,6 +2256,7 @@
                         );
 
                         refreshStoreSummary();
+                        updateDiagStatusUI();
 
                         if (p.netStats) {
                             const el =
@@ -2052,7 +2286,10 @@
                     "hit a stretch of already-collected content (likely end of available/loaded history)",
 
                 likely_rate_limited:
-                    "page showed something that looks like a rate-limit/error message — this is a strong signal it's a platform-side throttle, not an end of content",
+                    "page or network layer showed something that looks like a rate-limit/error signal — this is a strong signal it's a platform-side throttle, not an end of content",
+
+                navigated_away:
+                    "the page stopped being a list timeline mid-run (soft navigation or a reload) — restart once you're back on the list",
 
                 max_scrolls:
                     "hit the max-scrolls limit — scroll down a bit manually and click Start again to continue",
@@ -2187,6 +2424,7 @@
                         `Switching to saved list "${requested}"...`;
 
                     currentDataset = requested;
+                    saveLastDatasetName(currentDataset);
 
                     await loadDatasetState(
                         currentDataset
@@ -2204,6 +2442,7 @@
                     );
 
                     refreshStoreSummary();
+                    updateDiagStatusUI();
                     await refreshDatasetList();
 
                     statusEl.textContent =
