@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JSON X-list collector
 // @namespace    local.tweetcollector
-// @version      2.2
+// @version      2.3
 // @description  Scrapes tweets from an X/Twitter LIST timeline into JSON.
 // @match        https://x.com/i/lists/*
 // @match        https://twitter.com/i/lists/*
@@ -396,6 +396,8 @@
         );
     }
 
+    const expandGiveUpIds = new Set();
+
     async function expandShowMoreButtons(articles) {
         const entries = [];
 
@@ -407,6 +409,8 @@
             if (btn) {
                 const statusId =
                     extractStatusId(article) || "(no status id)";
+
+                if (expandGiveUpIds.has(statusId)) continue;
 
                 const beforeEl =
                     article.querySelector('[data-testid="tweetText"]');
@@ -468,8 +472,12 @@
             .map(e => e.statusId);
 
         if (unresolved.length > 0) {
+            for (const id of unresolved) {
+                expandGiveUpIds.add(id);
+            }
+
             console.warn(
-                `${LOG_TAG} gave up expanding (still truncated when stored):`,
+                `${LOG_TAG} gave up expanding (will not retry these again this session):`,
                 unresolved
             );
         }
@@ -856,6 +864,67 @@
         }
     }
 
+    async function exportDirPermissionGranted() {
+        if (!exportDirHandle) return false;
+
+        try {
+            const state = await exportDirHandle.queryPermission({
+                mode: "readwrite"
+            });
+
+            return state === "granted";
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function exportArchiveKey(datasetName) {
+        return storageKeyForDataset(datasetName) + "::exportArchive";
+    }
+
+    async function archiveFallbackExport(filename, rows) {
+        try {
+            const key = exportArchiveKey(currentDataset);
+            const archive = (await idbGet(key)) || [];
+
+            archive.push({ t: Date.now(), filename, rows });
+
+            if (archive.length > 20) {
+                archive.shift();
+            }
+
+            await idbSet(key, archive);
+        } catch (e) {
+            console.error(
+                `${LOG_TAG} failed to write fallback export to the recovery archive`,
+                e
+            );
+        }
+    }
+
+    async function dumpExportArchive() {
+        let archive;
+
+        try {
+            archive = (await idbGet(exportArchiveKey(currentDataset))) || [];
+        } catch (e) {
+            archive = [];
+        }
+
+        if (archive.length === 0) return 0;
+
+        const allRows = dedupeBatchKeepLongest(
+            archive.flatMap(a => a.rows)
+        );
+
+        downloadJson(
+            `tweets_${slugifyDataset(currentDataset)}_recovered_archive.json`,
+            toJson(allRows)
+        );
+
+        return allRows.length;
+    }
+
     let diagRingBuffer = [];
     let lastDiagWriteAt = null;
     let lastDiagWriteError = null;
@@ -1224,6 +1293,16 @@
             const toWrite =
                 dedupeBatchKeepLongest(pendingBatch);
 
+            exportActive =
+                !!exportDirHandle &&
+                (await exportDirPermissionGranted());
+
+            if (exportDirHandle && !exportActive) {
+                await logHeapSnapshot(diagnosticSettings, {
+                    note: "export folder permission not currently granted — using direct-download fallback until a manual re-grant"
+                });
+            }
+
             if (exportActive) {
                 const filename =
                     `tweets_${slugifyDataset(currentDataset)}_part${String(exportPartNum).padStart(4, "0")}_${Date.now()}.json`;
@@ -1273,7 +1352,7 @@
                 exportActive = false;
 
                 console.warn(
-                    `${LOG_TAG} export folder write failed — falling back to per-batch downloads for the rest of this run.`
+                    `${LOG_TAG} export folder write failed despite granted permission — falling back to a direct download for this batch.`
                 );
             }
 
@@ -1284,6 +1363,8 @@
                 filename,
                 toJson(toWrite)
             );
+
+            await archiveFallbackExport(filename, toWrite);
 
             const writtenCount =
                 pendingBatch.length;
@@ -1311,7 +1392,7 @@
                     lastDiagWriteError
                 },
                 cooldownMessage:
-                    `No export folder available — downloaded ${writtenCount} tweets as ${filename} instead (${reason}).`
+                    `Direct-download fallback used for ${writtenCount} tweets (${filename}, reason: ${reason}) — also archived in browser storage as a safety net in case the download itself gets silently blocked; use "Recover export archive" if files don't show up.`
             });
         }
 
@@ -1752,6 +1833,10 @@
         <span id="tc-export-dir-label">No folder chosen (auto-export off until you pick one)</span>
       </div>
       <div class="tc-row">
+        <button id="tc-regrant-dir" class="secondary">Re-grant folder access</button>
+        <button id="tc-recover-archive" class="secondary">Recover export archive</button>
+      </div>
+      <div class="tc-row">
         <label><input type="checkbox" id="tc-autoexport-enabled" checked style="width:auto;"> Auto-export every
           <input type="number" id="tc-autoexport-every" value="1000" min="10" max="50000" style="width:70px;">
           tweets, then wipe from browser storage
@@ -2124,6 +2209,42 @@
                     } catch (e) {}
                 }
             );
+
+        document
+            .getElementById("tc-regrant-dir")
+            .addEventListener("click", async () => {
+                if (!exportDirHandle) {
+                    statusEl.textContent =
+                        'No export folder has been chosen yet — click "Choose export folder" first.';
+
+                    return;
+                }
+
+                try {
+                    const result =
+                        await exportDirHandle.requestPermission({
+                            mode: "readwrite"
+                        });
+
+                    statusEl.textContent =
+                        result === "granted"
+                            ? "Export folder access re-granted — auto-export to disk will resume on the next flush."
+                            : `Permission request returned "${result}" — auto-export to disk stays off until this is granted.`;
+                } catch (e) {
+                    statusEl.textContent = `Re-grant attempt failed: ${e && e.message ? e.message : e}`;
+                }
+            });
+
+        document
+            .getElementById("tc-recover-archive")
+            .addEventListener("click", async () => {
+                const count = await dumpExportArchive();
+
+                statusEl.textContent =
+                    count > 0
+                        ? `Recovered ${count} tweet(s) from the fallback-export safety net and downloaded them.`
+                        : "Nothing in the recovery archive for this saved list.";
+            });
 
         document
             .getElementById(
