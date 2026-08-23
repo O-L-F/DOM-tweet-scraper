@@ -265,6 +265,7 @@
     }
 
     const httpErrorLog = [];
+    const networkFailureLog = [];
 
     function recordHttpErrorStatus(status, url) {
         httpErrorLog.push({ t: Date.now(), status, url: String(url || "") });
@@ -283,6 +284,27 @@
         return httpErrorLog.filter(e => now - e.t <= windowMs).length;
     }
 
+    function recordNetworkFailure(url, message) {
+        networkFailureLog.push({
+            t: Date.now(),
+            url: String(url || ""),
+            message: String(message || "")
+        });
+
+        if (networkFailureLog.length > 100) {
+            networkFailureLog.shift();
+        }
+
+        if (verboseNetworkLogging) {
+            console.warn(`${LOG_TAG} network-level failure on ${url}: ${message}`);
+        }
+    }
+
+    function recentNetworkFailureCount(windowMs = 60000) {
+        const now = Date.now();
+        return networkFailureLog.filter(e => now - e.t <= windowMs).length;
+    }
+
     function patchNetworkForDiagnostics() {
         if (netLog.patched) return;
 
@@ -293,6 +315,7 @@
         if (origFetch) {
             window.fetch = function (...args) {
                 let url = "";
+                let isTimelineCall = false;
 
                 try {
                     url =
@@ -302,7 +325,9 @@
 
                     maybeLogGraphqlCall(url);
 
-                    if (looksLikeTimelinePaginationUrl(url)) {
+                    isTimelineCall = looksLikeTimelinePaginationUrl(url);
+
+                    if (isTimelineCall) {
                         recordTimelineRequest(url);
                     }
                 } catch (e) {}
@@ -314,6 +339,7 @@
                         res => {
                             try {
                                 if (
+                                    isTimelineCall &&
                                     res &&
                                     (res.status === 429 ||
                                         res.status === 403 ||
@@ -323,7 +349,14 @@
                                 }
                             } catch (e) {}
                         },
-                        () => {}
+                        err => {
+                            if (isTimelineCall) {
+                                recordNetworkFailure(
+                                    url,
+                                    err && err.message
+                                );
+                            }
+                        }
                     );
                 }
 
@@ -337,20 +370,30 @@
             try {
                 maybeLogGraphqlCall(url);
 
-                if (looksLikeTimelinePaginationUrl(url)) {
+                const isTimelineCall =
+                    looksLikeTimelinePaginationUrl(url);
+
+                if (isTimelineCall) {
                     recordTimelineRequest(url);
                 }
 
                 this.addEventListener("loadend", () => {
                     try {
                         if (
-                            this.status === 429 ||
-                            this.status === 403 ||
-                            this.status >= 500
+                            isTimelineCall &&
+                            (this.status === 429 ||
+                                this.status === 403 ||
+                                this.status >= 500)
                         ) {
                             recordHttpErrorStatus(this.status, url);
                         }
                     } catch (e) {}
+                });
+
+                this.addEventListener("error", () => {
+                    if (isTimelineCall) {
+                        recordNetworkFailure(url, "xhr network error");
+                    }
                 });
             } catch (e) {}
 
@@ -382,6 +425,10 @@
 
     function looksRateLimited() {
         if (recentHttpErrorCount(60000) > 0) {
+            return true;
+        }
+
+        if (recentNetworkFailureCount(60000) > 0) {
             return true;
         }
 
@@ -889,7 +936,7 @@
 
             archive.push({ t: Date.now(), filename, rows });
 
-            if (archive.length > 20) {
+            if (archive.length > 200) {
                 archive.shift();
             }
 
@@ -959,6 +1006,7 @@
                 : null,
             visibility: document.visibilityState,
             recentHttpErrors: recentHttpErrorCount(300000),
+            recentNetworkFailures: recentNetworkFailureCount(300000),
             note: (extra && extra.note) || null,
             settings: {
                 maxScrolls: s.maxScrolls,
@@ -1059,7 +1107,8 @@
                     recentRingBuffer: diagRingBuffer,
                     lastDiagWriteAt,
                     lastDiagWriteError,
-                    recentHttpErrorLog: httpErrorLog
+                    recentHttpErrorLog: httpErrorLog,
+                    recentNetworkFailureLog: networkFailureLog
                 },
                 null,
                 2
@@ -1220,6 +1269,7 @@
     }
 
     const SOFT_RATE_CAP_PER_MIN = 30;
+    const MAX_COOLDOWN_MS = 20 * 60 * 1000;
 
     async function runCollectionLoop({
         account,
@@ -1574,9 +1624,12 @@
                         Math.pow(1.7, retriesUsed - 1);
 
                     const thisCooldown =
-                        jitter(
-                            cooldownMs * backoffMultiplier,
-                            0.25
+                        Math.min(
+                            jitter(
+                                cooldownMs * backoffMultiplier,
+                                0.25
+                            ),
+                            MAX_COOLDOWN_MS
                         );
 
                     onProgress({
@@ -1602,12 +1655,28 @@
                         note: `rate-limit signal, retry ${retriesUsed}/${maxRetries}`
                     });
 
+                    const cooldownStartedAt = Date.now();
+                    const cooldownStartedHidden =
+                        document.visibilityState !== "visible";
+
                     await sleep(thisCooldown);
 
-                    window.scrollBy(0, -200);
+                    const actualCooldownMs =
+                        Date.now() - cooldownStartedAt;
+
+                    if (actualCooldownMs > thisCooldown * 1.5) {
+                        await logHeapSnapshot(diagnosticSettings, {
+                            note:
+                                `cooldown took ${Math.round(actualCooldownMs / 1000)}s vs ` +
+                                `configured ${Math.round(thisCooldown / 1000)}s (tab hidden at start: ${cooldownStartedHidden}) — ` +
+                                `likely background-tab timer throttling stretching the wait, not a persistent rate-limit condition`
+                        });
+                    }
+
+                    window.scrollBy(0, -jitter(400, 0.3));
                     await sleep(400);
 
-                    window.scrollBy(0, 250);
+                    window.scrollBy(0, jitter(1300, 0.4));
                     await sleep(jitter(pauseMs));
 
                     continue;
@@ -1636,9 +1705,12 @@
                         Math.pow(1.7, retriesUsed - 1);
 
                     const thisCooldown =
-                        jitter(
-                            cooldownMs * backoffMultiplier,
-                            0.25
+                        Math.min(
+                            jitter(
+                                cooldownMs * backoffMultiplier,
+                                0.25
+                            ),
+                            MAX_COOLDOWN_MS
                         );
 
                     onProgress({
@@ -1660,12 +1732,28 @@
                             `No new tweets loading. Cooling down ~${Math.round(thisCooldown / 60000)} min before retry ${retriesUsed}/${maxRetries}...`
                     });
 
+                    const cooldownStartedAt = Date.now();
+                    const cooldownStartedHidden =
+                        document.visibilityState !== "visible";
+
                     await sleep(thisCooldown);
 
-                    window.scrollBy(0, -200);
+                    const actualCooldownMs =
+                        Date.now() - cooldownStartedAt;
+
+                    if (actualCooldownMs > thisCooldown * 1.5) {
+                        await logHeapSnapshot(diagnosticSettings, {
+                            note:
+                                `cooldown took ${Math.round(actualCooldownMs / 1000)}s vs ` +
+                                `configured ${Math.round(thisCooldown / 1000)}s (tab hidden at start: ${cooldownStartedHidden}) — ` +
+                                `likely background-tab timer throttling stretching the wait, not a persistent stall`
+                        });
+                    }
+
+                    window.scrollBy(0, -jitter(400, 0.3));
                     await sleep(400);
 
-                    window.scrollBy(0, 250);
+                    window.scrollBy(0, jitter(1300, 0.4));
                     await sleep(jitter(pauseMs));
 
                     consecutiveNoNewTweets = 0;
