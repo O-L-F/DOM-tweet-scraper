@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JSON X-list collector
 // @namespace    local.tweetcollector
-// @version      2.3
+// @version      2.4
 // @description  Scrapes tweets from an X/Twitter LIST timeline into JSON.
 // @match        https://x.com/i/lists/*
 // @match        https://twitter.com/i/lists/*
@@ -15,6 +15,64 @@
 
     const LOG_TAG = "[TweetCollector]";
     const UNKNOWN_AUTHOR_TAG = "unknown_author";
+    let sleep = function (ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    };
+
+    (function setupWorkerBackedSleep() {
+        let tickerWorker = null;
+
+        try {
+            const tickerWorkerSrc =
+                'self.onmessage=function(e){var id=e.data.id,ms=e.data.ms;setTimeout(function(){self.postMessage({id:id});},ms);};';
+
+            tickerWorker = new Worker(
+                URL.createObjectURL(
+                    new Blob([tickerWorkerSrc], { type: "application/javascript" })
+                )
+            );
+        } catch (e) {
+            console.warn(
+                `${LOG_TAG} worker-backed pacing unavailable (${e && e.message ? e.message : e}) — falling back to main-thread timers, which will stretch out while this tab is hidden.`
+            );
+
+            tickerWorker = null;
+        }
+
+        if (!tickerWorker) return;
+
+        let seq = 0;
+        const pending = new Map();
+
+        tickerWorker.onmessage = e => {
+            const resolve = pending.get(e.data.id);
+
+            if (resolve) {
+                pending.delete(e.data.id);
+                resolve();
+            }
+        };
+
+        tickerWorker.onerror = () => {
+            console.warn(
+                `${LOG_TAG} pacing worker errored — falling back to main-thread timers for the rest of this session.`
+            );
+
+            tickerWorker = null;
+        };
+
+        sleep = function (ms) {
+            if (!tickerWorker) {
+                return new Promise(resolve => setTimeout(resolve, ms));
+            }
+
+            return new Promise(resolve => {
+                const id = ++seq;
+                pending.set(id, resolve);
+                tickerWorker.postMessage({ id, ms });
+            });
+        };
+    })();
 
     function simpleHash(str) {
         let h = 0;
@@ -695,6 +753,23 @@
     let seenIds = {};
     let pendingBatch = [];
 
+    
+    const MAX_SEEN_PER_ACCOUNT = 20000;
+
+    function trimSeenIndexIfNeeded(acct) {
+        const m = seenIds[acct];
+        if (!m || m.size <= MAX_SEEN_PER_ACCOUNT) return;
+
+        const excess = m.size - MAX_SEEN_PER_ACCOUNT;
+        const it = m.keys();
+
+        for (let i = 0; i < excess; i++) {
+            const k = it.next().value;
+            if (k === undefined) break;
+            m.delete(k);
+        }
+    }
+
     async function loadDatasetState(datasetName) {
         seenIds = {};
         pendingBatch = [];
@@ -824,10 +899,12 @@
 
             if (priorLen === undefined) {
                 seenIds[acct].set(t.id, t.text.length);
+                trimSeenIndexIfNeeded(acct);
                 pendingBatch.push(record);
                 addedItems.push(record);
             } else if (t.text.length > priorLen) {
                 seenIds[acct].set(t.id, t.text.length);
+                trimSeenIndexIfNeeded(acct);
                 pendingBatch.push(record);
                 updatedItems.push(record);
             } else {
@@ -920,6 +997,24 @@
             });
 
             return state === "granted";
+        } catch (e) {
+            return false;
+        }
+    }
+
+    
+    async function ensureExportPermissionAtStart() {
+        if (!exportDirHandle) return true; 
+
+        const granted = await exportDirPermissionGranted();
+        if (granted) return true;
+
+        try {
+            const result = await exportDirHandle.requestPermission({
+                mode: "readwrite"
+            });
+
+            return result === "granted";
         } catch (e) {
             return false;
         }
@@ -1032,8 +1127,9 @@
 
             log.push(entry);
 
-            if (log.length > 3000) {
-                log.shift();
+            
+            if (log.length > 500) {
+                log.splice(0, log.length - 500);
             }
 
             await idbSet(key, log);
@@ -1052,10 +1148,9 @@
 
     function startDiagInterval(settings) {
         stopDiagInterval();
-
         diagIntervalHandle = setInterval(() => {
             logHeapSnapshot(settings);
-        }, 20000);
+        }, 60000);
     }
 
     function stopDiagInterval() {
@@ -1125,10 +1220,6 @@
     let collecting = false;
     let stopRequested = false;
     let recentTweets = [];
-
-    function sleep(ms) {
-        return new Promise(resolve => setTimeout(resolve, ms));
-    }
 
     function randInt(min, max) {
         return Math.floor(
@@ -1270,6 +1361,7 @@
 
     const SOFT_RATE_CAP_PER_MIN = 30;
     const MAX_COOLDOWN_MS = 20 * 60 * 1000;
+    const HEAP_EMERGENCY_MB = 800;
 
     async function runCollectionLoop({
         account,
@@ -1299,6 +1391,7 @@
         let stopReason = "max_scrolls";
         let stepsUntilLongPause = randInt(8, 14);
         let retriesUsed = 0;
+        let permissionLostMidRun = false;
 
         const sessionAccounts = new Set();
 
@@ -1348,9 +1441,12 @@
                 (await exportDirPermissionGranted());
 
             if (exportDirHandle && !exportActive) {
+                
                 await logHeapSnapshot(diagnosticSettings, {
-                    note: "export folder permission not currently granted — using direct-download fallback until a manual re-grant"
+                    note: "export folder permission lost mid-run — writing this batch as a fallback download, then stopping the run"
                 });
+
+                permissionLostMidRun = true;
             }
 
             if (exportActive) {
@@ -1565,6 +1661,28 @@
                 await flushExportBatch(
                     "threshold reached"
                 );
+
+                if (permissionLostMidRun) {
+                    stopReason = "export_permission_lost";
+                    break;
+                }
+            }
+
+            if (
+                performance.memory &&
+                performance.memory.usedJSHeapSize / 1048576 > HEAP_EMERGENCY_MB
+            ) {
+                await logHeapSnapshot(diagnosticSettings, {
+                    note: `heap crossed the ${HEAP_EMERGENCY_MB}MB safety threshold — flushing and stopping instead of continuing to grow`
+                });
+
+                await flushExportBatch("emergency heap threshold");
+
+                stopReason = permissionLostMidRun
+                    ? "export_permission_lost"
+                    : "heap_threshold_stop";
+
+                break;
             }
 
             if (
@@ -1815,7 +1933,8 @@
                 sessionAccounts.size,
             plannedBreaksTaken,
             exportsWritten,
-            exportActive
+            exportActive,
+            permissionLostMidRun
         };
     }
 
@@ -1847,6 +1966,7 @@
       #tc-panel button.danger { background: transparent; border: 1px solid #f4212e; color: #f4212e; }
       #tc-panel button:disabled { opacity: 0.4; cursor: not-allowed; }
       #tc-panel .tc-status { margin-top: 8px; font-size: 12px; color: #8b98a5; min-height: 32px; }
+      #tc-panel .tc-tip { margin-top: 4px; font-size: 11px; color: #536471; }
       #tc-panel input[type=number] {
         width: 55px; background: #0e1217; border: 1px solid #2a3140; color: #e7e9ea;
         border-radius: 6px; padding: 3px 6px; font-size: 12px;
@@ -2407,6 +2527,21 @@
                     "Heads up: auto-export is off, so nothing is saved durably during this run — only in memory until you stop and manually export. Recommended for short test runs only.";
             }
 
+            
+            if (s.autoExportEnabled && exportDirHandle) {
+                statusEl.textContent =
+                    "Checking export folder permission...";
+
+                const ok = await ensureExportPermissionAtStart();
+
+                if (!ok) {
+                    statusEl.textContent =
+                        'Export folder permission was not granted. Click "Re-grant folder access" and try Start again, or uncheck auto-export.';
+
+                    return;
+                }
+            }
+
             startBtn.disabled = true;
             stopBtn.disabled = false;
 
@@ -2502,6 +2637,12 @@
 
                 max_scrolls:
                     "hit the max-scrolls limit — scroll down a bit manually and click Start again to continue",
+
+                export_permission_lost:
+                    'the export folder\'s write permission was revoked mid-run — this batch was saved as a fallback download instead. Click "Re-grant folder access" then Start again to continue with disk export.',
+
+                heap_threshold_stop:
+                    `memory usage crossed the ${HEAP_EMERGENCY_MB}MB safety threshold — pending data was flushed and the run stopped early; safe to click Start again to resume`,
 
                 user_stopped:
                     "stopped by you"
