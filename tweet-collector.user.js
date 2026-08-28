@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JSON X-list collector
 // @namespace    local.tweetcollector
-// @version      2.4
+// @version      4.0
 // @description  Scrapes tweets from an X/Twitter LIST timeline into JSON.
 // @match        https://x.com/i/lists/*
 // @match        https://twitter.com/i/lists/*
@@ -9,70 +9,15 @@
 // @run-at       document-idle
 // ==/UserScript==
 
-
 (function () {
     "use strict";
 
     const LOG_TAG = "[TweetCollector]";
     const UNKNOWN_AUTHOR_TAG = "unknown_author";
-    let sleep = function (ms) {
+
+    function sleep(ms) {
         return new Promise(resolve => setTimeout(resolve, ms));
-    };
-
-    (function setupWorkerBackedSleep() {
-        let tickerWorker = null;
-
-        try {
-            const tickerWorkerSrc =
-                'self.onmessage=function(e){var id=e.data.id,ms=e.data.ms;setTimeout(function(){self.postMessage({id:id});},ms);};';
-
-            tickerWorker = new Worker(
-                URL.createObjectURL(
-                    new Blob([tickerWorkerSrc], { type: "application/javascript" })
-                )
-            );
-        } catch (e) {
-            console.warn(
-                `${LOG_TAG} worker-backed pacing unavailable (${e && e.message ? e.message : e}) — falling back to main-thread timers, which will stretch out while this tab is hidden.`
-            );
-
-            tickerWorker = null;
-        }
-
-        if (!tickerWorker) return;
-
-        let seq = 0;
-        const pending = new Map();
-
-        tickerWorker.onmessage = e => {
-            const resolve = pending.get(e.data.id);
-
-            if (resolve) {
-                pending.delete(e.data.id);
-                resolve();
-            }
-        };
-
-        tickerWorker.onerror = () => {
-            console.warn(
-                `${LOG_TAG} pacing worker errored — falling back to main-thread timers for the rest of this session.`
-            );
-
-            tickerWorker = null;
-        };
-
-        sleep = function (ms) {
-            if (!tickerWorker) {
-                return new Promise(resolve => setTimeout(resolve, ms));
-            }
-
-            return new Promise(resolve => {
-                const id = ++seq;
-                pending.set(id, resolve);
-                tickerWorker.postMessage({ id, ms });
-            });
-        };
-    })();
+    }
 
     function simpleHash(str) {
         let h = 0;
@@ -481,6 +426,26 @@
         };
     }
 
+    function isElementVisible(el) {
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+    }
+
+
+    function findVisibleRetryButton() {
+        const buttons = document.querySelectorAll("button");
+
+        for (const b of buttons) {
+            const t = (b.textContent || "").trim();
+
+            if (t === "Retry" && isElementVisible(b)) {
+                return b;
+            }
+        }
+
+        return null;
+    }
+
     function looksRateLimited() {
         if (recentHttpErrorCount(60000) > 0) {
             return true;
@@ -752,14 +717,13 @@
     let currentDataset = loadLastDatasetName();
     let seenIds = {};
     let pendingBatch = [];
-
-    
     const MAX_SEEN_PER_ACCOUNT = 20000;
 
     function trimSeenIndexIfNeeded(acct) {
         const m = seenIds[acct];
         if (!m || m.size <= MAX_SEEN_PER_ACCOUNT) return;
 
+       
         const excess = m.size - MAX_SEEN_PER_ACCOUNT;
         const it = m.keys();
 
@@ -952,12 +916,16 @@
 
         a.href = url;
         a.download = filename;
+        a.style.display = "none";
 
         document.body.appendChild(a);
         a.click();
-        document.body.removeChild(a);
 
-        URL.revokeObjectURL(url);
+        
+        setTimeout(() => {
+            if (a.parentNode) document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }, 30000);
     }
 
     let exportDirHandle = null;
@@ -1148,6 +1116,8 @@
 
     function startDiagInterval(settings) {
         stopDiagInterval();
+
+        
         diagIntervalHandle = setInterval(() => {
             logHeapSnapshot(settings);
         }, 60000);
@@ -1219,6 +1189,7 @@
 
     let collecting = false;
     let stopRequested = false;
+    let supervisorRunning = false;
     let recentTweets = [];
 
     function randInt(min, max) {
@@ -1361,7 +1332,6 @@
 
     const SOFT_RATE_CAP_PER_MIN = 30;
     const MAX_COOLDOWN_MS = 20 * 60 * 1000;
-    const HEAP_EMERGENCY_MB = 800;
 
     async function runCollectionLoop({
         account,
@@ -1391,7 +1361,6 @@
         let stopReason = "max_scrolls";
         let stepsUntilLongPause = randInt(8, 14);
         let retriesUsed = 0;
-        let permissionLostMidRun = false;
 
         const sessionAccounts = new Set();
 
@@ -1443,10 +1412,8 @@
             if (exportDirHandle && !exportActive) {
                 
                 await logHeapSnapshot(diagnosticSettings, {
-                    note: "export folder permission lost mid-run — writing this batch as a fallback download, then stopping the run"
+                    note: "export folder permission not currently granted — using direct-download fallback for this batch"
                 });
-
-                permissionLostMidRun = true;
             }
 
             if (exportActive) {
@@ -1661,28 +1628,6 @@
                 await flushExportBatch(
                     "threshold reached"
                 );
-
-                if (permissionLostMidRun) {
-                    stopReason = "export_permission_lost";
-                    break;
-                }
-            }
-
-            if (
-                performance.memory &&
-                performance.memory.usedJSHeapSize / 1048576 > HEAP_EMERGENCY_MB
-            ) {
-                await logHeapSnapshot(diagnosticSettings, {
-                    note: `heap crossed the ${HEAP_EMERGENCY_MB}MB safety threshold — flushing and stopping instead of continuing to grow`
-                });
-
-                await flushExportBatch("emergency heap threshold");
-
-                stopReason = permissionLostMidRun
-                    ? "export_permission_lost"
-                    : "heap_threshold_stop";
-
-                break;
             }
 
             if (
@@ -1732,6 +1677,19 @@
             }
 
             if (suspectRateLimitNow) {
+                const retryBtn = findVisibleRetryButton();
+
+                if (retryBtn) {
+                    await logHeapSnapshot(diagnosticSettings, {
+                        note: "clicked X's own \"Retry\" button on a \"Something went wrong\" tombstone"
+                    });
+
+                    retryBtn.click();
+                    await sleep(jitter(2500, 0.3));
+
+                    continue;
+                }
+
                 if (
                     autoRetryEnabled &&
                     retriesUsed < maxRetries
@@ -1933,8 +1891,7 @@
                 sessionAccounts.size,
             plannedBreaksTaken,
             exportsWritten,
-            exportActive,
-            permissionLostMidRun
+            exportActive
         };
     }
 
@@ -2028,6 +1985,13 @@
           tweets, for
           <input type="number" id="tc-longbreak-minutes" value="5" min="1" max="180" style="width:50px;">
           min
+        </label>
+      </div>
+      <div class="tc-tip">Tip: if you're running this on more than one machine on the same network at once, use a longer Pause (ms) and a shorter "every N tweets" break interval — it eases how correlated the two look to rate-limit heuristics.</div>
+      <div class="tc-row">
+        <label>When paused (rate limit, stall, batch boundary), auto-resume after ~
+          <input type="number" id="tc-resume-minutes" value="6" min="1" max="120" style="width:55px;">
+          min (jittered) — runs unattended until you click Stop or the date cutoff is reached
         </label>
       </div>
       <div class="tc-row">
@@ -2300,7 +2264,15 @@
             verboseConsoleLogging:
                 document.getElementById(
                     "tc-verbose-logging"
-                ).checked
+                ).checked,
+
+            resumeAfterMinutes:
+                parseInt(
+                    document.getElementById(
+                        "tc-resume-minutes"
+                    ).value,
+                    10
+                ) || 6
         };
     }
 
@@ -2364,6 +2336,12 @@
         document.getElementById(
             "tc-autoexport-every"
         ).value = settings.exportEveryN;
+
+        if (settings.resumeAfterMinutes) {
+            document.getElementById(
+                "tc-resume-minutes"
+            ).value = settings.resumeAfterMinutes;
+        }
     }
 
     function initUI() {
@@ -2480,8 +2458,170 @@
                 }
             );
 
+        function describeStopReason(reason, stopBeforeDate) {
+            return (
+                {
+                    date_cutoff:
+                        `reached tweets older than ${stopBeforeDate} and stopped there`,
+
+                    no_new_tweets:
+                        "hit a stretch of already-collected content (likely end of available/loaded history)",
+
+                    likely_rate_limited:
+                        "page or network layer showed something that looks like a rate-limit/error signal",
+
+                    navigated_away:
+                        "the page isn't on a list timeline right now",
+
+                    max_scrolls:
+                        "reached this batch's scroll limit (not a problem — just a checkpoint)",
+
+                    user_stopped:
+                        "stopped by you"
+                }[reason] || reason
+            );
+        }
+
+        
+        const IMMEDIATE_RESUME_REASONS = new Set(["max_scrolls"]);
+        const TERMINAL_REASONS = new Set(["user_stopped", "date_cutoff"]);
+
+        function cancelableSleep(ms) {
+            return new Promise(resolve => {
+                const start = Date.now();
+
+                (function check() {
+                    if (
+                        !supervisorRunning ||
+                        Date.now() - start >= ms
+                    ) {
+                        resolve();
+                    } else {
+                        setTimeout(check, 500);
+                    }
+                })();
+            });
+        }
+
+        async function runOneCycle(s, stopBeforeDate, cooldownMs, pauseEveryTweets) {
+            return runCollectionLoop({
+                account: UNKNOWN_AUTHOR_TAG,
+                maxScrolls: s.maxScrolls,
+                scrollStepPx: 600,
+                pauseMs: s.pauseMs,
+                stopBeforeDate,
+                scrollStrategy: s.scrollStrategy,
+                autoRetryEnabled: s.autoRetryEnabled,
+                cooldownMs,
+                maxRetries: s.maxRetries,
+                stopOnSeenTweets: s.stopOnSeenTweets,
+                pauseEveryTweets,
+                pauseMinutes: s.pauseMinutes,
+                autoExportEnabled: s.autoExportEnabled,
+                exportEveryN: s.exportEveryN,
+                diagnosticSettings: s,
+
+                onProgress: p => {
+                    const acctNote =
+                        p.accountsThisSession > 1
+                            ? ` across ${p.accountsThisSession} accounts`
+                            : "";
+
+                    statusEl.textContent =
+                        p.cooldownMessage ||
+                        (
+                            `scroll ${p.scrollCount}/${p.maxScrolls} — ` +
+                            `+${p.sessionAdded} new, ${p.totalForAccount} total seen this session${acctNote}, ${pendingBatch.length} pending export.` +
+                            (
+                                p.retriesUsed
+                                    ? ` (retry ${p.retriesUsed}/${s.maxRetries} used)`
+                                    : ""
+                            )
+                        );
+
+                    renderPreview(p.recentTweets);
+                    refreshStoreSummary();
+                    updateDiagStatusUI();
+
+                    if (p.netStats) {
+                        const el =
+                            document.getElementById("tc-netstats");
+
+                        el.textContent =
+                            `Timeline requests seen this session: ${p.netStats.total}` +
+                            (
+                                p.netStats.lastAgoSec !== null
+                                    ? ` (last one ${p.netStats.lastAgoSec}s ago, ${p.netStats.ratePerMin}/min)`
+                                    : ""
+                            );
+                    }
+                }
+            });
+        }
+
+        async function runSupervisorLoop(s, stopBeforeDate, cooldownMs, pauseEveryTweets) {
+            let totalsAdded = 0;
+            let cycles = 0;
+
+            while (supervisorRunning) {
+                if (!isOnListTimeline()) {
+                    statusEl.textContent =
+                        "Not on a list timeline right now — waiting, will keep checking...";
+
+                    await cancelableSleep(jitter(30000, 0.3));
+                    continue;
+                }
+
+                cycles++;
+
+                const result =
+                    await runOneCycle(
+                        s,
+                        stopBeforeDate,
+                        cooldownMs,
+                        pauseEveryTweets
+                    );
+
+                totalsAdded += result.sessionAdded;
+
+                if (!supervisorRunning) break;
+
+                if (TERMINAL_REASONS.has(result.stopReason)) {
+                    const acctNote =
+                        result.accountsThisSession > 1
+                            ? ` across ${result.accountsThisSession} accounts`
+                            : "";
+
+                    statusEl.textContent =
+                        `Done. Added ${totalsAdded} new tweets total${acctNote} over ${cycles} cycle(s). ` +
+                        `Stopped because: ${describeStopReason(result.stopReason, stopBeforeDate)}. ` +
+                        `Total timeline requests observed: ${result.finalNetStats.total}.`;
+
+                    supervisorRunning = false;
+                    break;
+                }
+
+                const waitMs =
+                    IMMEDIATE_RESUME_REASONS.has(result.stopReason)
+                        ? jitter(8000, 0.5)
+                        : jitter(s.resumeAfterMinutes * 60000, 0.45);
+
+                statusEl.textContent =
+                    `Paused (${describeStopReason(result.stopReason, stopBeforeDate)}). ` +
+                    `+${totalsAdded} new so far over ${cycles} cycle(s). ` +
+                    `Auto-resuming in ~${Math.round(waitMs / 60000) || 1} min...`;
+
+                await cancelableSleep(waitMs);
+            }
+
+            refreshStoreSummary();
+
+            startBtn.disabled = false;
+            stopBtn.disabled = true;
+        }
+
         async function startCollecting() {
-            if (collecting) {
+            if (collecting || supervisorRunning) {
                 statusEl.textContent =
                     "A collection run is already in progress — stop it before starting a new one.";
 
@@ -2542,143 +2682,19 @@
                 }
             }
 
+            supervisorRunning = true;
             startBtn.disabled = true;
             stopBtn.disabled = false;
 
             statusEl.textContent =
                 `Collecting this list... (scroll 0/${s.maxScrolls})`;
 
-            const result =
-                await runCollectionLoop({
-                    account:
-                        UNKNOWN_AUTHOR_TAG,
-                    maxScrolls:
-                        s.maxScrolls,
-                    scrollStepPx: 600,
-                    pauseMs:
-                        s.pauseMs,
-                    stopBeforeDate,
-                    scrollStrategy:
-                        s.scrollStrategy,
-                    autoRetryEnabled:
-                        s.autoRetryEnabled,
-                    cooldownMs,
-                    maxRetries:
-                        s.maxRetries,
-                    stopOnSeenTweets:
-                        s.stopOnSeenTweets,
-                    pauseEveryTweets,
-                    pauseMinutes:
-                        s.pauseMinutes,
-                    autoExportEnabled:
-                        s.autoExportEnabled,
-                    exportEveryN:
-                        s.exportEveryN,
-                    diagnosticSettings:
-                        s,
-
-                    onProgress: p => {
-                        const acctNote =
-                            p.accountsThisSession > 1
-                                ? ` across ${p.accountsThisSession} accounts`
-                                : "";
-
-                        statusEl.textContent =
-                            p.cooldownMessage ||
-                            (
-                                `scroll ${p.scrollCount}/${p.maxScrolls} — ` +
-                                `+${p.sessionAdded} new, ${p.totalForAccount} total seen this session${acctNote}, ${pendingBatch.length} pending export.` +
-                                (
-                                    p.retriesUsed
-                                        ? ` (retry ${p.retriesUsed}/${s.maxRetries} used)`
-                                        : ""
-                                )
-                            );
-
-                        renderPreview(
-                            p.recentTweets
-                        );
-
-                        refreshStoreSummary();
-                        updateDiagStatusUI();
-
-                        if (p.netStats) {
-                            const el =
-                                document.getElementById(
-                                    "tc-netstats"
-                                );
-
-                            el.textContent =
-                                `Timeline requests seen this session: ${p.netStats.total}` +
-                                (
-                                    p.netStats.lastAgoSec !== null
-                                        ? ` (last one ${p.netStats.lastAgoSec}s ago, ${p.netStats.ratePerMin}/min)`
-                                        : ""
-                                );
-                        }
-                    }
-                });
-
-            startBtn.disabled = false;
-            stopBtn.disabled = true;
-
-            const reasonText = {
-                date_cutoff:
-                    `reached tweets older than ${stopBeforeDate} and stopped there`,
-
-                no_new_tweets:
-                    "hit a stretch of already-collected content (likely end of available/loaded history)",
-
-                likely_rate_limited:
-                    "page or network layer showed something that looks like a rate-limit/error signal — this is a strong signal it's a platform-side throttle, not an end of content",
-
-                navigated_away:
-                    "the page stopped being a list timeline mid-run (soft navigation or a reload) — restart once you're back on the list",
-
-                max_scrolls:
-                    "hit the max-scrolls limit — scroll down a bit manually and click Start again to continue",
-
-                export_permission_lost:
-                    'the export folder\'s write permission was revoked mid-run — this batch was saved as a fallback download instead. Click "Re-grant folder access" then Start again to continue with disk export.',
-
-                heap_threshold_stop:
-                    `memory usage crossed the ${HEAP_EMERGENCY_MB}MB safety threshold — pending data was flushed and the run stopped early; safe to click Start again to resume`,
-
-                user_stopped:
-                    "stopped by you"
-            }[result.stopReason] ||
-                result.stopReason;
-
-            const retryNote =
-                result.retriesUsed
-                    ? ` Used ${result.retriesUsed} auto-retry cooldown(s) along the way.`
-                    : "";
-
-            const breakNote =
-                result.plannedBreaksTaken
-                    ? ` Took ${result.plannedBreaksTaken} scheduled break(s).`
-                    : "";
-
-            const exportNote =
-                result.exportActive
-                    ? ` Wrote ${result.exportsWritten} export file(s) to disk and wiped them from browser storage.`
-                    : (
-                        s.autoExportEnabled
-                            ? " Export folder wasn't available for at least part of this run — check for fallback download files."
-                            : " Auto-export was off — remember to export manually before closing the tab."
-                    );
-
-            const acctNote =
-                result.accountsThisSession > 1
-                    ? ` across ${result.accountsThisSession} accounts`
-                    : "";
-
-            statusEl.textContent =
-                `Done. Added ${result.sessionAdded} new tweets${acctNote} ` +
-                `(${result.scrollCount} scroll steps). Stopped because: ${reasonText}.${retryNote}${breakNote}${exportNote} ` +
-                `Total timeline requests observed: ${result.finalNetStats.total}.`;
-
-            refreshStoreSummary();
+            runSupervisorLoop(
+                s,
+                stopBeforeDate,
+                cooldownMs,
+                pauseEveryTweets
+            );
         }
 
         startBtn.addEventListener(
@@ -2689,10 +2705,11 @@
         stopBtn.addEventListener(
             "click",
             () => {
+                supervisorRunning = false;
                 stopCollection();
 
                 statusEl.textContent =
-                    "Stopping after current step...";
+                    "Stopping after current step (won't auto-resume)...";
 
                 stopBtn.disabled = true;
             }
